@@ -32,8 +32,11 @@ class FailureTest(unittest.TestCase):
 
     def test_duplicate_and_valve_conflict(self):
         item = self.service.create_item(self.payload, "d", "dispatcher")
-        with self.assertRaises(ConflictError):
-            self.service.create_item(self.payload, "d", "dispatcher")
+        # 同管段半小时内的重复告警并入已有事件，而不是新建记录
+        again = self.service.create_item(self.payload, "d", "dispatcher")
+        self.assertTrue(again.get("merged"))
+        self.assertEqual(again["id"], item["id"])
+        item = self.service.get_item(item["id"])
         item["payload"]["valve_status_conflict"] = False
         item = self.service.act(item["id"], "verify", {"field_confirmed": True}, "r", "responder", item["version"])
         with self.assertRaises(DomainError) as context:

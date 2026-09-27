@@ -2,15 +2,20 @@ from datetime import datetime
 
 
 class DomainError(Exception):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, details=None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.details = details
+
+    def with_details(self, details):
+        self.details = details
+        return self
 
 
 class ConflictError(DomainError):
-    def __init__(self, code, message):
-        super().__init__(code, message, 409)
+    def __init__(self, code, message, details=None):
+        super().__init__(code, message, 409, details)
 
 
 class NotFoundError(DomainError):
@@ -47,6 +52,27 @@ def parse_timestamp(payload, name):
     return value
 
 
+def optional_text(payload, name):
+    value = payload.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise DomainError("invalid_field", "%s 必须是非空字符串" % name)
+    return value.strip()
+
+
+def optional_int(payload, name):
+    if name not in payload or payload.get(name) is None:
+        return None
+    try:
+        value = int(payload.get(name))
+    except (TypeError, ValueError):
+        raise DomainError("invalid_number", "%s 必须是整数" % name)
+    if value < 0:
+        raise DomainError("invalid_odor_reports", "异味报告数不能为负数")
+    return value
+
+
 def normalize_create(payload):
     pipeline_id = require_text(payload, "pipeline_id")
     segment_id = require_text(payload, "segment_id")
@@ -57,6 +83,7 @@ def normalize_create(payload):
     if odor_reports < 0:
         raise DomainError("invalid_odor_reports", "异味报告数不能为负数")
     reporter = require_text(payload, "reporter")
+    external_id = optional_text(payload, "external_id")
     stable_key = "%s|%s|%s" % (pipeline_id, segment_id, reported_at)
     return {
         "pipeline_id": pipeline_id,
@@ -66,6 +93,7 @@ def normalize_create(payload):
         "sensor_value_ppm": sensor_ppm,
         "odor_reports": odor_reports,
         "reporter": reporter,
+        "external_id": external_id,
         "source_comparison": [],
         "valve_sequence": [],
         "hazards_clear": False,
@@ -83,7 +111,7 @@ def normalize_source(payload):
         "observed_at": observed_at,
         "sensor_value_ppm": number(payload, "sensor_value_ppm", 0) if "sensor_value_ppm" in payload else None,
         "pressure_drop_kpa": number(payload, "pressure_drop_kpa", 0) if "pressure_drop_kpa" in payload else None,
-        "odor_reports": int(payload.get("odor_reports", 0) or 0),
+        "odor_reports": optional_int(payload, "odor_reports"),
         "note": payload.get("note", ""),
     }
     return result

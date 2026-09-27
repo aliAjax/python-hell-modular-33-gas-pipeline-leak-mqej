@@ -70,6 +70,8 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS sources_external_uidx
+                    ON sources(source_type, external_id);
                 """
             )
         finally:
@@ -105,10 +107,46 @@ class Repository:
             (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
         )
 
-    def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
+    def find_source_by_external_id(self, source_type, external_id):
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM sources WHERE source_type=? AND external_id=?",
+                (source_type, external_id),
+            ).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["payload"] = json.loads(result["payload"])
+            return result
+        finally:
+            conn.close()
+
+    def create_item(self, entity_type, stable_key, initial_status, payload, actor, role, initial_source=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            if initial_source is not None:
+                dup = conn.execute(
+                    "SELECT id, item_id FROM sources WHERE source_type=? AND external_id=?",
+                    (initial_source["source_type"], initial_source["external_id"]),
+                ).fetchone()
+                if dup is not None:
+                    raise ConflictError(
+                        "duplicate_external_id",
+                        "外部编号 %s/%s 已经登记（事件 #%s，来源 #%s）" % (
+                            initial_source["source_type"],
+                            initial_source["external_id"],
+                            dup["item_id"],
+                            dup["id"],
+                        ),
+                        details={
+                            "source_id": dup["id"],
+                            "item_id": dup["item_id"],
+                            "source_type": initial_source["source_type"],
+                            "external_id": initial_source["external_id"],
+                        },
+                    )
             try:
                 conn.execute(
                     "INSERT INTO items(entity_type,stable_key,status,version,payload,created_by,created_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -127,6 +165,32 @@ class Repository:
             except sqlite3.IntegrityError:
                 raise ConflictError("duplicate_item", "同一业务实体已经存在")
             item_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            if initial_source is not None:
+                conn.execute(
+                    "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        item_id,
+                        initial_source["source_type"],
+                        initial_source["external_id"],
+                        canonical_json(initial_source["payload"]),
+                        initial_source["observed_at"],
+                        now_iso(),
+                    ),
+                )
+                source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "source_recorded",
+                    actor,
+                    role,
+                    {
+                        "source_id": source_id,
+                        "source_type": initial_source["source_type"],
+                        "external_id": initial_source["external_id"],
+                        "initial": True,
+                    },
+                )
             self.append_audit(conn, item_id, "created", actor, role, {"stable_key": stable_key})
             conn.execute("COMMIT")
             return self.get_item(item_id)
@@ -160,13 +224,30 @@ class Repository:
         finally:
             conn.close()
 
-    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role, pending_update=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
+            item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if item is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
+            dup = conn.execute(
+                "SELECT id, item_id FROM sources WHERE source_type=? AND external_id=?",
+                (source_type, external_id),
+            ).fetchone()
+            if dup is not None:
+                raise ConflictError(
+                    "duplicate_external_id",
+                    "外部编号 %s/%s 已经登记（事件 #%s，来源 #%s）" % (
+                        source_type, external_id, dup["item_id"], dup["id"]
+                    ),
+                    details={
+                        "source_id": dup["id"],
+                        "item_id": dup["item_id"],
+                        "source_type": source_type,
+                        "external_id": external_id,
+                    },
+                )
             try:
                 conn.execute(
                     "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
@@ -183,8 +264,39 @@ class Repository:
                 role,
                 {"source_id": source_id, "source_type": source_type, "external_id": external_id},
             )
+            if pending_update is not None:
+                new_payload = pending_update["payload"]
+                new_status = pending_update["status"]
+                pending_entries = new_payload.get("pending_verifications", [])
+                for entry in pending_entries:
+                    if entry.get("source_id") is None and entry.get("external_id") == external_id:
+                        entry["source_id"] = source_id
+                version = int(item["version"]) + 1
+                conn.execute(
+                    "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                    (new_status, version, canonical_json(new_payload), now_iso(), item_id),
+                )
+                self.append_audit(
+                    conn,
+                    item_id,
+                    "source_conflict",
+                    actor,
+                    role,
+                    {
+                        "source_id": source_id,
+                        "new_status": new_status,
+                        "pending_verifications": new_payload.get("pending_verifications", []),
+                    },
+                )
             conn.execute("COMMIT")
-            return {"id": source_id, "item_id": item_id, "source_type": source_type, "external_id": external_id, "payload": payload, "observed_at": observed_at}
+            return self.get_item(item_id), {
+                "id": source_id,
+                "item_id": item_id,
+                "source_type": source_type,
+                "external_id": external_id,
+                "payload": payload,
+                "observed_at": observed_at,
+            }
         except Exception:
             try:
                 conn.execute("ROLLBACK")
