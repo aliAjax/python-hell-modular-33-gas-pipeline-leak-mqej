@@ -2,15 +2,16 @@ from datetime import datetime
 
 
 class DomainError(Exception):
-    def __init__(self, code, message, status=400):
+    def __init__(self, code, message, status=400, details=None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.details = details
 
 
 class ConflictError(DomainError):
-    def __init__(self, code, message):
-        super().__init__(code, message, 409)
+    def __init__(self, code, message, details=None):
+        super().__init__(code, message, 409, details=details)
 
 
 class NotFoundError(DomainError):
@@ -83,7 +84,39 @@ def normalize_source(payload):
         "observed_at": observed_at,
         "sensor_value_ppm": number(payload, "sensor_value_ppm", 0) if "sensor_value_ppm" in payload else None,
         "pressure_drop_kpa": number(payload, "pressure_drop_kpa", 0) if "pressure_drop_kpa" in payload else None,
-        "odor_reports": int(payload.get("odor_reports", 0) or 0),
+        "odor_reports": int(payload.get("odor_reports")) if payload.get("odor_reports") is not None else None,
         "note": payload.get("note", ""),
     }
     return result
+
+
+def normalize_alarm(payload):
+    """告警入口：调度台每来一条外部系统（巡检/SCADA/传感）的告警时提交。"""
+    source_type = require_text(payload, "source_type")
+    external_id = require_text(payload, "external_id")
+    observed_at = parse_timestamp(payload, "observed_at")
+    pipeline_id = require_text(payload, "pipeline_id")
+    segment_id = require_text(payload, "segment_id")
+    pressure_drop = number(payload, "pressure_drop_kpa", 0) if payload.get("pressure_drop_kpa") is not None else 0.0
+    sensor_ppm = number(payload, "sensor_value_ppm", 0) if payload.get("sensor_value_ppm") is not None else 0.0
+    odor_raw = payload.get("odor_reports")
+    odor_reports = int(odor_raw or 0)
+    if odor_reports < 0:
+        raise DomainError("invalid_odor_reports", "异味报告数不能为负数")
+    reporter = payload.get("reporter")
+    if not isinstance(reporter, str) or not reporter.strip():
+        reporter = source_type
+    note = payload.get("note", "")
+    return {
+        "source_type": source_type,
+        "external_id": external_id,
+        "observed_at": observed_at,
+        "pipeline_id": pipeline_id,
+        "segment_id": segment_id,
+        "pressure_drop_kpa": pressure_drop,
+        "sensor_value_ppm": sensor_ppm,
+        "odor_reports": odor_reports,
+        "reporter": reporter.strip(),
+        "note": note,
+        "_stable_key": "%s|%s" % (source_type, external_id),
+    }
